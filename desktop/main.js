@@ -212,11 +212,26 @@ function relaunchServer() {
 
 let window = null
 
+// The window icon must match the desktop shortcut icon: the same official
+// deepseek.ico. Packaged builds place it next to the exe (build.js copies it
+// to the app root); dev builds keep it under desktop/assets/.
+function windowIcon() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, '..', 'deepseek.ico')
+  }
+  return path.join(__dirname, 'assets', 'deepseek.ico')
+}
+
+/** Fixed window/app name — never let the page title or anything else change it. */
+const APP_TITLE = 'DeepSeek Harness'
+
 function openWindow(url) {
+  const iconPath = windowIcon()
   window = new BrowserWindow({
     width: 1400,
     height: 900,
-    title: 'DeepSeek Harness',
+    title: APP_TITLE,
+    icon: fs.existsSync(iconPath) ? iconPath : undefined,
     autoHideMenuBar: true,
     webPreferences: {
       contextIsolation: true,
@@ -225,6 +240,13 @@ function openWindow(url) {
     },
   })
   window.setMenuBarVisibility(false)
+  window.setTitle(APP_TITLE)
+  // Lock the title bar name: the served page's <title> must not rename the
+  // window (it would desync from the desktop shortcut name).
+  window.on('page-title-updated', (event) => {
+    event.preventDefault()
+    window.setTitle(APP_TITLE)
+  })
   window.loadURL(url)
   window.on('closed', () => {
     window = null
@@ -242,6 +264,11 @@ const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
+  // Fixed app identity: the process name, window title, and taskbar group
+  // all show "DeepSeek Harness", matching the desktop shortcut name.
+  app.setName(APP_TITLE)
+  app.setAppUserModelId('ai.deepseek.harness.desktop')
+
   app.on('second-instance', () => {
     if (window !== null) {
       if (window.isMinimized()) window.restore()
