@@ -1,0 +1,13 @@
+# Generated build artifacts — never commit
+desktop/node_modules/
+desktop/runtime/
+desktop/dist/
+desktop/.smoke-userdata/
+
+# Local caches used by the build
+.npm-cache/
+.electron-cache/
+
+# OS noise
+Thumbs.db
+.DS_Store
