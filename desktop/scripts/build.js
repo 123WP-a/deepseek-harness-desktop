@@ -1,13 +1,16 @@
 // DeepSeek Harness desktop build — assembles a self-contained app folder.
 //
 // Layout produced under desktop/dist/DeepSeek Harness/:
-//   DeepSeek Harness.exe        renamed Electron binary (double-click to launch)
-//   resources/app/              this shell: main.js + package.json
+//   DeepSeek Harness.exe        Electron binary with the DeepSeek icon embedded
+//   resources/app.asar          this shell (main.js + appearance.js + package.json)
 //   resources/runtime/          the dsh server runtime closure (npm-installed)
+//   deepseek.ico                official icon, next to the exe for the shortcut
 //
-// The app folder is self-contained: the exe embeds the Electron runtime, and
-// the server closure ships inside resources/runtime. Nothing else needs to be
-// installed on the target machine.
+// The folder is built by electron-builder (win dir target): it embeds the
+// official icon into the exe — the taskbar and pinned-icon source — which a
+// plain rename of electron.exe cannot do. The app folder is self-contained:
+// the exe embeds the Electron runtime, and the server closure ships inside
+// resources/runtime. Nothing else needs to be installed on the target machine.
 
 const { execFileSync } = require('node:child_process')
 const fs = require('node:fs')
@@ -27,15 +30,7 @@ function copy(src, dest) {
 }
 
 function main() {
-  // 1. Electron binary distribution (already downloaded by npm postinstall).
-  const electronDist = path.join(ROOT, 'node_modules', 'electron', 'dist')
-  if (!fs.existsSync(path.join(electronDist, 'electron.exe'))) {
-    throw new Error(
-      'Electron distribution not found. Run: npm install --prefix desktop',
-    )
-  }
-
-  // 2. The dsh server runtime closure (npm-installed @deepseek-ai/dsh + deps).
+  // 1. The dsh server runtime closure (npm-installed @deepseek-ai/dsh + deps).
   const runtimeNodeModules = path.join(ROOT, 'runtime', 'node_modules')
   if (!fs.existsSync(path.join(runtimeNodeModules, '@deepseek-ai', 'dsh', 'lib', 'bin.js'))) {
     throw new Error(
@@ -43,42 +38,49 @@ function main() {
     )
   }
 
-  rmrf(APP_DIR)
-  fs.mkdirSync(path.join(APP_DIR, 'resources', 'app'), { recursive: true })
-
-  // 3. The renamed executable — the click target.
-  copy(electronDist, APP_DIR)
-  fs.renameSync(
-    path.join(APP_DIR, 'electron.exe'),
-    path.join(APP_DIR, `${APP_NAME}.exe`),
-  )
-
-  // 4. This shell (main.js + package.json) as the packaged app entry.
-  copy(path.join(ROOT, 'main.js'), path.join(APP_DIR, 'resources', 'app', 'main.js'))
-  copy(path.join(ROOT, 'appearance.js'), path.join(APP_DIR, 'resources', 'app', 'appearance.js'))
-  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
-  const appManifest = {
-    name: manifest.name,
-    version: manifest.version,
-    main: 'main.js',
-    private: true,
-  }
-  fs.writeFileSync(
-    path.join(APP_DIR, 'resources', 'app', 'package.json'),
-    JSON.stringify(appManifest, null, 2) + '\n',
-  )
-
-  // 4b. The official black DeepSeek Harness icon, next to the exe for the
-  // desktop shortcut (IconLocation) and for the window icon.
+  // 2. The official icon (embedded into the exe + kept next to it).
   const icon = path.join(ROOT, 'assets', 'deepseek.ico')
-  if (fs.existsSync(icon)) {
-    copy(icon, path.join(APP_DIR, 'deepseek.ico'))
-  } else {
-    console.warn('deepseek.ico not found; run: node scripts/make-icon.js (needs sharp)')
+  if (!fs.existsSync(icon)) {
+    throw new Error('deepseek.ico not found. Run: node scripts/make-icon.js (needs sharp)')
   }
 
-  // 5. The server runtime closure.
+  // 3. electron-builder win dir target: packages main.js + appearance.js into
+  // app.asar, embeds the icon into DeepSeek Harness.exe, and copies the
+  // runtime closure into resources/runtime. The window icon (BrowserWindow)
+  // and the taskbar/pinned icon (exe resource) then both come from the same
+  // deepseek.ico, matching the desktop shortcut.
+  const builderCli = path.join(ROOT, 'node_modules', 'electron-builder', 'cli.js')
+  if (!fs.existsSync(builderCli)) {
+    throw new Error('electron-builder not installed. Run: npm install --prefix desktop')
+  }
+  execFileSync(process.execPath, [
+    builderCli,
+    '--win', 'dir',
+    '--config', 'electron-builder.config.cjs',
+  ], {
+    cwd: ROOT,
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      ELECTRON_BUILDER_BINARIES_MIRROR: process.env.ELECTRON_BUILDER_BINARIES_MIRROR
+        ?? 'https://npmmirror.com/mirrors/electron-builder-binaries/',
+    },
+  })
+
+  // 4. Copy the builder output to the canonical app folder (win-unpacked is
+  // electron-builder's intermediate location; dist/DeepSeek Harness is the
+  // stable path the desktop shortcut points at).
+  const unpacked = path.join(DIST, 'installer', 'win-unpacked')
+  rmrf(APP_DIR)
+  copy(unpacked, APP_DIR)
+
+  // 4b. The server runtime closure. Copied here rather than via electron-
+  // builder's extraResources: that mechanism skips node_modules trees, so
+  // the 246MB runtime closure would silently vanish from the build.
   copy(runtimeNodeModules, path.join(APP_DIR, 'resources', 'runtime', 'node_modules'))
+
+  // 5. Keep the icon next to the exe for the desktop shortcut's IconLocation.
+  copy(icon, path.join(APP_DIR, 'deepseek.ico'))
 
   console.log(`Built ${APP_DIR}`)
   console.log(`Double-click ${path.join(APP_DIR, `${APP_NAME}.exe`)} to launch.`)

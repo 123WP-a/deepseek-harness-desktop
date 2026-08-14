@@ -16,15 +16,9 @@ module.exports = {
     'appearance.js',
     'package.json',
   ],
-  extraResources: [
-    {
-      from: path.join(__dirname, 'runtime'),
-      to: 'runtime',
-      filter: ['**/*', '!**/package-lock.json'],
-    },
-  ],
   win: {
-    target: ['portable'],
+    target: ['portable', 'dir'],
+    icon: path.join(__dirname, 'assets', 'deepseek.ico'),
   },
   portable: {
     artifactName: 'DeepSeek-Harness-${version}-portable.exe',
