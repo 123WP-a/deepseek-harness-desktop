@@ -273,8 +273,10 @@ if (!gotLock) {
 } else {
   // Fixed app identity: the process name, window title, and taskbar group
   // all show "DeepSeek Harness", matching the desktop shortcut name.
+  // NOTE: no setAppUserModelId here — an AUMID with no registered display
+  // name makes Windows fall back to the generic "Electron" taskbar label;
+  // without it the taskbar uses the window title (locked to APP_TITLE below).
   app.setName(APP_TITLE)
-  app.setAppUserModelId('ai.deepseek.harness.desktop')
 
   app.on('second-instance', () => {
     if (window !== null) {
