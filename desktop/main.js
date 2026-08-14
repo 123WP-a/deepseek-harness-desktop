@@ -12,12 +12,13 @@
 //  4. Clean shutdown: closing the window (or quitting the app) terminates the
 //     server process tree.
 
-const { app, BrowserWindow, dialog } = require('electron')
+const { app, BrowserWindow, dialog, nativeTheme } = require('electron')
 const { spawn, spawnSync } = require('node:child_process')
 const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const fs = require('node:fs')
+const { startAppearanceSync } = require('./appearance.js')
 
 // Headless smoke runs may execute in a confined environment where the default
 // %APPDATA% userData is unwritable; keep smoke state in a writable temp dir
@@ -211,6 +212,8 @@ function relaunchServer() {
 // ---------------------------------------------------------------------------
 
 let window = null
+/** Disposer for the settings-file watcher; assigned after app ready. */
+let stopAppearanceSync = () => {}
 
 // The window icon must match the desktop shortcut icon: the same official
 // deepseek.ico. Packaged builds place it next to the exe (build.js copies it
@@ -232,6 +235,10 @@ function openWindow(url) {
     height: 900,
     title: APP_TITLE,
     icon: fs.existsSync(iconPath) ? iconPath : undefined,
+    // Match the harness Appearance setting while the page loads: dark theme
+    // gets a dark background, so there is no white flash before the page
+    // paints its own background.
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#111111' : '#ffffff',
     autoHideMenuBar: true,
     webPreferences: {
       contextIsolation: true,
@@ -277,6 +284,10 @@ if (!gotLock) {
   })
 
   app.whenReady().then(() => {
+    // Sync the window's native theme with the Web UI Appearance setting
+    // before any window exists; the watcher keeps it live as the user edits
+    // settings in the page.
+    stopAppearanceSync = startAppearanceSync()
     try {
       spawnServer()
     } catch (error) {
@@ -291,6 +302,7 @@ if (!gotLock) {
   })
 
   app.on('before-quit', () => {
+    stopAppearanceSync()
     killServerTree()
   })
 }

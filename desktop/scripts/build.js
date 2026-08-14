@@ -55,6 +55,7 @@ function main() {
 
   // 4. This shell (main.js + package.json) as the packaged app entry.
   copy(path.join(ROOT, 'main.js'), path.join(APP_DIR, 'resources', 'app', 'main.js'))
+  copy(path.join(ROOT, 'appearance.js'), path.join(APP_DIR, 'resources', 'app', 'appearance.js'))
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
   const appManifest = {
     name: manifest.name,

@@ -13,6 +13,7 @@ module.exports = {
   },
   files: [
     'main.js',
+    'appearance.js',
     'package.json',
   ],
   extraResources: [
