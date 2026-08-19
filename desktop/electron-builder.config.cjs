@@ -14,6 +14,7 @@ module.exports = {
   },
   files: [
     'main.js',
+    'preload.js',
     'appearance.js',
     'package.json',
   ],

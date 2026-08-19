@@ -12,7 +12,7 @@
 //  4. Clean shutdown: closing the window (or quitting the app) terminates the
 //     server process tree.
 
-const { app, BrowserWindow, dialog, nativeTheme } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, nativeTheme } = require('electron')
 const { spawn, spawnSync } = require('node:child_process')
 const http = require('node:http')
 const os = require('node:os')
@@ -38,7 +38,28 @@ function runtimeRoot() {
   return path.join(__dirname, 'runtime')
 }
 
+// Prefer the user-installed dsh (global npm) so the desktop always matches the
+// dsh version the user runs/updates. The bundled runtime is only a fallback.
+function installedDshBin() {
+  const candidates = []
+  if (process.env.APPDATA) {
+    candidates.push(path.join(process.env.APPDATA, 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
+  }
+  if (process.env.ProgramFiles) {
+    candidates.push(path.join(process.env.ProgramFiles, 'nodejs', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
+  }
+  if (process.env.LOCALAPPDATA) {
+    candidates.push(path.join(process.env.LOCALAPPDATA, 'Programs', 'nodejs', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
+  }
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
 function serverBin() {
+  const installed = installedDshBin()
+  if (installed !== null) return installed
   return path.join(
     runtimeRoot(),
     'node_modules',
@@ -207,6 +228,37 @@ function relaunchServer() {
   }
 }
 
+function safeSpawnServer() {
+  try {
+    spawnServer()
+  } catch (error) {
+    dialog.showErrorBox('DeepSeek Harness — start failed', String(error))
+    app.quit()
+  }
+}
+
+// If a dsh web server is already listening on the default URL (e.g. another
+// dsh web / this profile is already running), reuse it instead of spawning a
+// second server. A second server on the same profile would fail to boot
+// (task-board ledger lock), so attaching is both faster and conflict-free.
+function tryOpenExistingServer() {
+  if (window !== null) return
+  const url = process.env.DSH_WEB_URL || 'http://127.0.0.1:3080'
+  const req = http.get(url, { timeout: 1500 }, (res) => {
+    res.resume()
+    if (res.statusCode >= 200 && res.statusCode < 500) {
+      openWindow(url)
+    } else {
+      safeSpawnServer()
+    }
+  })
+  req.on('error', () => safeSpawnServer())
+  req.on('timeout', () => {
+    req.destroy()
+    safeSpawnServer()
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
@@ -228,24 +280,130 @@ function windowIcon() {
 /** Fixed window/app name — never let the page title or anything else change it. */
 const APP_TITLE = 'DeepSeek Harness'
 
+function titleBarColors() {
+  const dark = nativeTheme.shouldUseDarkColors
+  return {
+    color: dark ? '#111111' : '#ffffff',
+    symbolColor: dark ? '#ffffff' : '#1a1a1a',
+  }
+}
+
+function injectDesktopTitlebar(webContents) {
+  // Reserve a 32px top band so the custom title bar never covers dsh / web-ui
+  // buttons: the whole app is pushed down by the band. The band is styled with
+  // official dsh tokens and carries the window controls on the right.
+  const css = [
+    'html,body{height:100%;}',
+    'body{padding-top:32px;box-sizing:border-box;}',
+    '#dsh-desktop-titlebar{position:fixed;top:0;left:0;right:0;height:32px;',
+    'display:flex;align-items:center;justify-content:space-between;',
+    'background:var(--dsw-alias-bg-base, var(--dsw-alias-bg-layer-1, #111111));',
+    'color:var(--dsw-alias-label-primary, #eeeeee);',
+    'border-bottom:1px solid var(--dsw-alias-border-l1, rgba(0,0,0,0.06));',
+    '-webkit-app-region:drag;z-index:2147483000;user-select:none;}',
+    '#dsh-desktop-titlebar .dsh-dt-title{font-size:12px;font-weight:600;padding-left:12px;',
+    'color:var(--dsw-alias-label-secondary, #999999);letter-spacing:0.02em;}',
+    '#dsh-desktop-titlebar .dsh-dt-buttons{display:flex;height:100%;-webkit-app-region:no-drag;}',
+    '#dsh-desktop-titlebar .dsh-dt-btn{width:46px;height:100%;border:none;background:transparent;',
+    'color:var(--dsw-alias-label-primary, #eeeeee);display:flex;align-items:center;justify-content:center;',
+    'cursor:default;padding:0;}',
+    '#dsh-desktop-titlebar .dsh-dt-btn:hover{background:var(--dsw-alias-interactive-bg-hover, rgba(0,0,0,0.08));}',
+    '#dsh-desktop-titlebar .dsh-dt-close:hover{background:var(--dsw-alias-state-error-primary, #e81123);color:#ffffff;}',
+    '#dsh-desktop-titlebar .dsh-dt-btn svg{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.2;}',
+  ].join('')
+  webContents.insertCSS(css)
+  const js = `(() => {
+    if (document.getElementById('dsh-desktop-titlebar')) return;
+    const bar = document.createElement('div');
+    bar.id = 'dsh-desktop-titlebar';
+    const title = document.createElement('span');
+    title.className = 'dsh-dt-title';
+    title.textContent = 'DeepSeek Harness';
+    const buttons = document.createElement('div');
+    buttons.className = 'dsh-dt-buttons';
+    buttons.innerHTML =
+      '<button class="dsh-dt-btn" data-action="minimize" aria-label="Minimize"><svg viewBox="0 0 12 12"><path d="M1 6h10"/></svg></button>' +
+      '<button class="dsh-dt-btn dsh-dt-maximize" data-action="maximize" aria-label="Maximize"><svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="0.5"/></svg></button>' +
+      '<button class="dsh-dt-btn dsh-dt-close" data-action="close" aria-label="Close"><svg viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8"/></svg></button>';
+    bar.appendChild(title);
+    bar.appendChild(buttons);
+    document.body.appendChild(bar);
+    const setMaxIcon = (max) => {
+      const b = document.querySelector('.dsh-dt-maximize');
+      if (!b) return;
+      b.innerHTML = max
+        ? '<svg viewBox="0 0 12 12"><path d="M3.5 1.5h7v7M1.5 3.5h7v7"/></svg>'
+        : '<svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="0.5"/></svg>';
+    };
+    bar.addEventListener('click', (event) => {
+      const btn = event.target.closest('button[data-action]');
+      if (!btn || !window.desktopWindow) return;
+      const action = btn.dataset.action;
+      if (action === 'minimize') window.desktopWindow.minimize();
+      else if (action === 'maximize') window.desktopWindow.toggleMaximize();
+      else if (action === 'close') window.desktopWindow.close();
+    });
+    if (window.desktopWindow && window.desktopWindow.isMaximized) {
+      window.desktopWindow.isMaximized().then(setMaxIcon).catch(() => {});
+      window.desktopWindow.onMaximizedChange(setMaxIcon);
+    }
+  })()`
+  webContents.executeJavaScript(js).catch(() => {})
+  // Some web-ui plugins render fixed buttons at the very top-right corner
+  // (e.g. dsh-better-sidebar's expand toggles). Those ignore body padding, so
+  // push any fixed top-right element below the 32px title-bar band. Geometry
+  // based, version-agnostic: future plugins with fixed top-right controls are
+  // handled automatically without touching plugin code.
+  const shiftJs = `(() => {
+    const BAND = 32;
+    const RIGHT_MARGIN = 220;
+    const shift = () => {
+      for (const el of document.querySelectorAll('body *')) {
+        if (el.id === 'dsh-desktop-titlebar') continue;
+        if (el.closest && el.closest('#dsh-desktop-titlebar')) continue;
+        if (el.dataset && el.dataset.dshDtShifted === 'true') continue;
+        let r;
+        try { r = el.getBoundingClientRect(); } catch { continue; }
+        if (!r || r.width <= 0 || r.height <= 0) continue;
+        if (r.top >= BAND || r.right <= window.innerWidth - RIGHT_MARGIN) continue;
+        const s = getComputedStyle(el);
+        if (s.position !== 'fixed') continue;
+        el.dataset.dshDtShifted = 'true';
+        el.style.setProperty('top', (Math.round(r.top + BAND)) + 'px', 'important');
+      }
+    };
+    shift();
+    setInterval(shift, 800);
+    window.addEventListener('resize', shift);
+  })()`
+  webContents.executeJavaScript(shiftJs).catch(() => {})
+}
+
 function openWindow(url) {
   const iconPath = windowIcon()
-  window = new BrowserWindow({
+  const useNativeTitleBar = process.env.DSH_DESKTOP_NATIVE_TITLEBAR === '1'
+  const overlay = titleBarColors()
+  const browserOptions = {
     width: 1400,
     height: 900,
     title: APP_TITLE,
     icon: fs.existsSync(iconPath) ? iconPath : undefined,
-    // Match the harness Appearance setting while the page loads: dark theme
-    // gets a dark background, so there is no white flash before the page
-    // paints its own background.
-    backgroundColor: nativeTheme.shouldUseDarkColors ? '#111111' : '#ffffff',
+    backgroundColor: overlay.color,
     autoHideMenuBar: true,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      preload: path.join(__dirname, 'preload.js'),
     },
-  })
+  }
+  if (!useNativeTitleBar) {
+    // Frameless integrated window: no native title bar, no native WCO overlay.
+    // Window controls are drawn by the injected in-page title bar, so nothing
+    // in the page's top-right corner is ever covered.
+    browserOptions.titleBarStyle = 'hidden'
+  }
+  window = new BrowserWindow(browserOptions)
   window.setMenuBarVisibility(false)
   window.setTitle(APP_TITLE)
   // Lock the title bar name: the served page's <title> must not rename the
@@ -254,6 +412,32 @@ function openWindow(url) {
     event.preventDefault()
     window.setTitle(APP_TITLE)
   })
+  if (!useNativeTitleBar) {
+    // Window-control IPC for the injected title bar.
+    ipcMain.on('dsh-desktop:minimize', () => { if (window !== null) window.minimize() })
+    ipcMain.on('dsh-desktop:toggle-maximize', () => {
+      if (window === null) return
+      if (window.isMaximized()) window.unmaximize()
+      else window.maximize()
+    })
+    ipcMain.on('dsh-desktop:close', () => { if (window !== null) window.close() })
+    ipcMain.handle('dsh-desktop:is-maximized', () => window !== null ? window.isMaximized() : false)
+    window.on('maximize', () => { if (window !== null) window.webContents.send('dsh-desktop:maximized', true) })
+    window.on('unmaximize', () => { if (window !== null) window.webContents.send('dsh-desktop:maximized', false) })
+
+    // The in-page title bar uses official CSS tokens, so it re-themes itself.
+    // Re-inject after navigation/theme changes (idempotent).
+    nativeTheme.on('updated', () => {
+      if (window === null) return
+      injectDesktopTitlebar(window.webContents)
+    })
+    const onDomReady = () => {
+      if (window === null) return
+      injectDesktopTitlebar(window.webContents)
+    }
+    window.webContents.on('dom-ready', onDomReady)
+    window.webContents.on('did-navigate', onDomReady)
+  }
   window.loadURL(url)
   window.on('closed', () => {
     window = null
@@ -291,7 +475,7 @@ if (!gotLock) {
     // settings in the page.
     stopAppearanceSync = startAppearanceSync()
     try {
-      spawnServer()
+      tryOpenExistingServer()
     } catch (error) {
       dialog.showErrorBox('DeepSeek Harness — start failed', String(error))
       app.quit()
