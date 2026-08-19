@@ -368,6 +368,15 @@ function injectDesktopTitlebar(webContents) {
         if (r.top >= BAND || r.right <= window.innerWidth - RIGHT_MARGIN) continue;
         const s = getComputedStyle(el);
         if (s.position !== 'fixed') continue;
+        // Skip background/fullscreen fixed layers (skin wallpaper, scrim,
+        // backdrop blur, fullscreen overlays): they are not top-right buttons
+        // and must not be pushed down by the title-bar band.
+        const z = Number(s.zIndex);
+        if (Number.isFinite(z) && z < 0) continue;
+        const isFullscreenLayer =
+          r.width >= window.innerWidth - 1 &&
+          r.height >= window.innerHeight - 1;
+        if (isFullscreenLayer) continue;
         el.dataset.dshDtShifted = 'true';
         el.style.setProperty('top', (Math.round(r.top + BAND)) + 'px', 'important');
       }
