@@ -17,6 +17,7 @@ module.exports = {
     'preload.js',
     'appearance.js',
     'update.js',
+    'preload.js',
     'package.json',
   ],
   win: {

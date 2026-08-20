@@ -19,13 +19,6 @@ const os = require('node:os')
 const path = require('node:path')
 const fs = require('node:fs')
 const { startAppearanceSync } = require('./appearance.js')
-const {
-  activatePendingUpdate,
-  checkForUpdate,
-  clearPendingUpdate,
-  installDshUpdate,
-  pendingUpdateVersion,
-} = require('./update.js')
 
 // Headless smoke runs may execute in a confined environment where the default
 // %APPDATA% userData is unwritable; keep smoke state in a writable temp dir
@@ -39,21 +32,8 @@ if (process.env.DSH_DESKTOP_SMOKE === '1') {
 // ---------------------------------------------------------------------------
 
 // In the packaged layout the runtime closure lives at resources/runtime; in
-// the dev layout it lives at desktop/runtime next to this file. An auto-updated
-// per-user runtime, when present, takes precedence over the bundled one.
-function userRuntimeRoot() {
-  return path.join(app.getPath('userData'), 'runtime')
-}
-
-function pendingRuntimeRoot() {
-  return path.join(app.getPath('userData'), 'runtime-next')
-}
-
+// the dev layout it lives at desktop/runtime next to this file.
 function runtimeRoot() {
-  const userRuntime = userRuntimeRoot()
-  if (fs.existsSync(path.join(userRuntime, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))) {
-    return userRuntime
-  }
   if (app.isPackaged) return path.join(process.resourcesPath, 'runtime')
   return path.join(__dirname, 'runtime')
 }
@@ -459,63 +439,10 @@ function openWindow(url) {
     window.webContents.on('did-navigate', onDomReady)
   }
   window.loadURL(url)
-  startAutoUpdate()
   window.on('closed', () => {
     window = null
     killServerTree()
     app.quit()
-  })
-}
-
-// ---------------------------------------------------------------------------
-// dsh runtime auto-update
-// ---------------------------------------------------------------------------
-
-function promptRestart(version) {
-  if (window === null) return
-  const choice = dialog.showMessageBoxSync(window, {
-    type: 'info',
-    title: 'DeepSeek Harness — 更新已就绪',
-    message: `dsh ${version} 已下载完成。`,
-    detail: '当前会话继续使用旧版本。重启应用后将自动切换到新版本。',
-    buttons: ['立即重启', '稍后'],
-    defaultId: 0,
-    cancelId: 1,
-  })
-  if (choice === 0) {
-    app.relaunch()
-    app.quit()
-  }
-}
-
-function startAutoUpdate() {
-  if (process.env.DSH_DESKTOP_DISABLE_UPDATE === '1' || process.env.DSH_DESKTOP_SMOKE === '1') return
-  const userData = app.getPath('userData')
-  const pendingRuntime = pendingRuntimeRoot()
-  const cacheDir = process.env.DSH_DESKTOP_NPM_CACHE || path.join(userData, 'npm-cache')
-  const channel = process.env.DSH_DESKTOP_UPDATE_CHANNEL || 'next'
-  const registry = process.env.DSH_DESKTOP_REGISTRY || undefined
-
-  checkForUpdate({ runtimeRoot: runtimeRoot(), channel, registry }).then(async (result) => {
-    if (!result.updateAvailable) {
-      clearPendingUpdate(pendingRuntime)
-      return
-    }
-    if (pendingUpdateVersion(pendingRuntime) === result.latestVersion) {
-      promptRestart(result.latestVersion)
-      return
-    }
-    await installDshUpdate({
-      version: result.latestVersion,
-      targetDir: pendingRuntime,
-      cacheDir,
-      registry,
-    })
-    promptRestart(result.latestVersion)
-  }).catch((error) => {
-    // Network/npm failures are non-fatal: the bundled or active runtime keeps
-    // serving, and the next launch retries.
-    console.error('[dsh-update]', error)
   })
 }
 
@@ -547,14 +474,6 @@ if (!gotLock) {
     // before any window exists; the watcher keeps it live as the user edits
     // settings in the page.
     stopAppearanceSync = startAppearanceSync()
-
-    // Apply a completed auto-update before the server starts. An incomplete
-    // staging directory from a crashed install is discarded.
-    const pendingRuntime = pendingRuntimeRoot()
-    if (pendingUpdateVersion(pendingRuntime) === undefined) clearPendingUpdate(pendingRuntime)
-    const activated = activatePendingUpdate(pendingRuntime, userRuntimeRoot())
-    if (activated !== undefined) console.log(`[dsh-update] activated ${activated}`)
-
     try {
       tryOpenExistingServer()
     } catch (error) {
