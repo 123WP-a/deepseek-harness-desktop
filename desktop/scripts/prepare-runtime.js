@@ -17,7 +17,7 @@ const path = require('node:path')
 
 const ROOT = path.join(__dirname, '..')
 const RUNTIME = path.join(ROOT, 'runtime')
-const DSH_VERSION = process.env.DSH_DESKTOP_VERSION || '0.1.0-rc.6'
+const DSH_VERSION = process.env.DSH_DESKTOP_VERSION || '0.1.0-rc.8'
 
 // Candidate source closures, in preference order. Each must contain
 // node_modules/@deepseek-ai/dsh/lib/bin.js.
