@@ -124,7 +124,7 @@ npx electron-builder --win portable --config electron-builder.config.cjs \
 
 - 渲染层：`contextIsolation` + `sandbox` 开启、`nodeIntegration` 关闭；页面仅能通过 `preload.js` 暴露的最小窗口控制桥与主进程通信。
 - 导航锁：主窗口只允许停留在本机 dsh 服务的同源页面；其他目标一律拦截，http(s) 转交系统浏览器打开。
-- 弹窗策略：页面发起的 `window.open` 同源走应用内窗口、外链转系统浏览器、其余 scheme 直接拒绝——不存在同权限弹窗注入面。
+- 弹窗策略：页面发起的 `window.open` 同源走应用内窗口、外链转系统浏览器、其余 scheme 直接拒绝；`about:blank` 工具弹窗（如 dsh-ssh 可拆卸终端）放行——其权限继承自沙箱渲染器，无法越权。
 - 权限请求：摄像头/麦克风/地理位置/通知等一律拒绝（Web UI 无此需求）。
 - 桌面壳自更新：仅接受比当前版本更高的 Release；下载内容先过 SHA256 校验、再过 asar 结构校验（帧格式 + 四个入口成员），双门通过才会暂存换装。
 - CI：Actions 全部固定到 commit SHA，工作流不使用任何 secrets。
