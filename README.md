@@ -17,18 +17,6 @@
 - **不弹浏览器**：拉起服务时探测 `--no-open` 支持（新版 dsh 默认把 URL 交给系统浏览器），避免桌面窗口与浏览器标签页同时弹出。
 - **用户数据**：会话、设置、凭据存储在标准 `$DSH_HOME`（默认 `~/.dsh`），与 CLI/Web 版一致。
 
-## 推荐搭配的 Web UI 插件
-
-以下社区插件与桌面端搭配使用效果最佳（均为 bundle 标准装法，点击名称进入仓库）：
-
-| 插件 | 用途 | 亮点 |
-|---|---|---|
-| [DSH-Plugins-Marketplace](https://github.com/bradeGithub/DSH-Plugins-Marketplace) | 插件市场 | 在 Web GUI 设置页一键浏览 / 安装 / 更新全部 `dsh-plugin` 生态插件，无需命令行 |
-| [dsh-usage-stats](https://github.com/wannanbigpig/dsh-usage-stats) | 用量与计费 | 侧栏常驻余额与今日消费、年度热图、24 小时柱状图、限额提醒；API Key 仅在服务端解析 |
-| [dsh-mpkg-wallpaper](https://github.com/XHR666/dsh-mpkg-wallpaper) | 壁纸引擎背景 | Wallpaper Engine mpkg / 创意工坊壁纸作网页背景，多时段切换与整屏磨砂虚化，与半透明主题契合 |
-
-> 提示：先装「插件市场」，其余插件即可直接在 Web GUI 里一键安装；也可参考各仓库 README 的 bundle 安装说明。
-
 ## 目录结构
 
 ```
