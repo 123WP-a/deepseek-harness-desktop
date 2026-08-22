@@ -1049,8 +1049,21 @@ function injectDesktopTitlebar(webContents) {
         let r;
         try { r = el.getBoundingClientRect(); } catch { continue; }
         if (!r || r.width <= 0 || r.height <= 0) continue;
+
         if (r.top >= BAND || r.right <= window.innerWidth - RIGHT_MARGIN) continue;
         // Control clusters only — never large translucent surfaces.
+        // Docked panels inside the better-sidebar host: full-height absolute
+        // surfaces anchored to the right edge must start below the title-bar
+        // band (they are functional UI in a known plugin host, not the
+        // fullscreen decorative layers skipped below). Host padding cannot
+        // move them: absolute children anchor to the padding-box top edge.
+        if (el.closest && el.closest('[data-dsh-panel-host]') && getComputedStyle(el).position === 'absolute'
+            && r.width < innerWidth * 0.6 && r.height > innerHeight * 0.5
+            && r.right >= innerWidth - 24) {
+          el.dataset.dshDtShifted = 'true'
+          el.style.setProperty('top', BAND + 'px', 'important')
+          el.style.setProperty('height', 'calc(100vh - ' + BAND + 'px)', 'important')
+          continue
         if (r.height > CONTROL_MAX_HEIGHT) continue;
         const s = getComputedStyle(el);
         // Fixed overlays AND absolute controls inside them both need the push:
@@ -1066,7 +1079,7 @@ function injectDesktopTitlebar(webContents) {
         // and must not be pushed down by the title-bar band.
         const z = Number(s.zIndex);
         if (Number.isFinite(z) && z < 0) continue;
-        const isFullscreenLayer =
+        }        const isFullscreenLayer =
           r.width >= window.innerWidth - 1 &&
           r.height >= window.innerHeight - 1;
         if (isFullscreenLayer) continue;
