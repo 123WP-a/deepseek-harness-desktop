@@ -973,6 +973,7 @@ function injectDesktopTitlebar(webContents) {
   const css = [
     'html,body{height:100%;}',
     'body{padding-top:32px;box-sizing:border-box;}',
+    '[data-dsh-panel-host]{padding-top:32px!important}',
     '#dsh-desktop-titlebar{position:fixed;top:0;left:0;right:0;height:32px;',
     'display:flex;align-items:center;justify-content:space-between;',
     'background:var(--dsw-alias-bg-base, var(--dsw-alias-bg-layer-1, #111111));',
