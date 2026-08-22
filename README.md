@@ -21,6 +21,11 @@
 
 [dsh-web-ui](https://github.com/zhu1090093659/dsh-web-ui) —— DSH Web GUI 的**插件与皮肤全家桶**（Apache-2.0，持续更新）：
 
+![皮肤中心的 Wallpaper Engine 壁纸效果](docs/skin-wallpaper-demo.jpg)
+
+*桌面端 × dsh-web-ui 皮肤中心：Wallpaper Engine 壁纸作为界面背景的实际效果。*
+
+
 - **功能插件**：梁神模式 agent 预设、任务看板、Git 图谱、右侧面板、移动端远程、SSH 运维、图像理解、鲸鱼娘宠物——每个都是独立成包的模块，可整装全家桶，也可只挑一两个；全部走官方 profile 机制挂载，不改 DSH 源码。
 - **皮肤中心 v2**：皮肤是纯资产目录（skin.json + 样式/贴图/特效），由皮肤中心即时加载——与官方版本彻底解耦，官方升级不牵动皮肤，新增皮肤无需发布安装。
 - **安装**：见其 README「快速开始」，支持聚合包 `@linxin666/dsh-web-ui-all` 一次装齐。
