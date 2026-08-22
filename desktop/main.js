@@ -12,10 +12,11 @@
 //  4. Clean shutdown: closing the window (or quitting the app) terminates the
 //     server process tree.
 
-const { app, BrowserWindow, dialog, ipcMain, nativeTheme } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } = require('electron')
 const { spawn, spawnSync } = require('node:child_process')
 const http = require('node:http')
 const https = require('node:https')
+const crypto = require('node:crypto')
 const os = require('node:os')
 const path = require('node:path')
 const fs = require('node:fs')
@@ -157,11 +158,60 @@ function bundledDshVersion() {
  * so the desktop passes --no-open when supported to avoid a second copy of
  * the UI popping up in a browser tab. Older builds (bundled 0.1.0-rc fallback)
  * reject unknown flags AND lack the auto-open behavior entirely, so skipping
- * the flag there is both required and harmless. Cached per binary path.
+ * the flag there is both required and harmless. Cached in memory and in
+ * userData/no-open-cache.json (keyed by path+size+mtime, so a dsh upgrade
+ * invalidates the entry naturally; the first launch after an upgrade pays one
+ * `--help` probe again).
  */
 const noOpenSupportCache = new Map()
+let noOpenDiskCacheLoaded = false
+
+/** On-disk cache path (userData/no-open-cache.json), or null before ready. */
+function noOpenCacheFile() {
+  try {
+    return path.join(app.getPath('userData'), 'no-open-cache.json')
+  } catch {
+    return null
+  }
+}
+
+/** Load persisted entries once; keys are `bin|mtimeMs|size`, so a dsh upgrade invalidates them naturally. */
+function loadNoOpenDiskCache() {
+  if (noOpenDiskCacheLoaded) return
+  noOpenDiskCacheLoaded = true
+  try {
+    const file = noOpenCacheFile()
+    if (file === null || !fs.existsSync(file)) return
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (parsed === null || typeof parsed !== 'object') return
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === 'boolean') noOpenSupportCache.set(key, value)
+    }
+  } catch {
+    // Corrupt cache: ignore it and recompute below.
+  }
+}
+
+/** Persist the in-memory map; best effort only. */
+function saveNoOpenDiskCache() {
+  try {
+    const file = noOpenCacheFile()
+    if (file === null) return
+    const entries = {}
+    for (const [key, value] of noOpenSupportCache) entries[key] = value
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, JSON.stringify(entries), 'utf8')
+  } catch {
+    // Cache write failures must never affect startup.
+  }
+}
+
 function supportsNoOpen(bin) {
-  const cached = noOpenSupportCache.get(bin)
+  loadNoOpenDiskCache()
+  let stat = null
+  try { stat = fs.statSync(bin) } catch { /* missing bin: fall back to path-only key */ }
+  const key = stat !== null ? `${bin}|${stat.mtimeMs}|${stat.size}` : bin
+  const cached = noOpenSupportCache.get(key)
   if (cached !== undefined) return cached
   let supported = false
   try {
@@ -175,7 +225,8 @@ function supportsNoOpen(bin) {
   } catch {
     supported = false
   }
-  noOpenSupportCache.set(bin, supported)
+  noOpenSupportCache.set(key, supported)
+  saveNoOpenDiskCache()
   return supported
 }
 
@@ -202,6 +253,18 @@ const LOCAL_VERSION_POLL_MS = 60_000
 const INSTALL_TIMEOUT_MS = 5 * 60 * 1000
 /** npm dist-tag to follow: rc prereleases ship on `next`, stable ones on `latest`. */
 const UPDATE_CHANNEL = process.env.DSH_DESKTOP_UPDATE_CHANNEL || 'next'
+
+// --- Desktop shell self-update (GitHub Releases) ---
+const SELF_UPDATE_REPO = process.env.DSH_DESKTOP_SELF_UPDATE_REPO || '123WP-a/deepseek-harness-desktop'
+const SELF_UPDATE_FIRST_CHECK_MS = 60_000
+const SELF_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
+const SELF_UPDATE_DOWNLOAD_TIMEOUT_MS = 120_000
+let selfUpdateTimer = null
+
+/** Registry override: wins over the machine's `npm config get registry` when set. */
+const REGISTRY_OVERRIDE = process.env.DSH_DESKTOP_REGISTRY || null
+/** 'auto' installs silently then prompts restart; 'notify' asks before installing. */
+const UPDATE_MODE = process.env.DSH_DESKTOP_UPDATE_MODE === 'notify' ? 'notify' : 'auto'
 
 /** dsh version this desktop session launched with (null = unknown). */
 let launchedDshVersion = null
@@ -248,8 +311,20 @@ function compareVersions(a, b) {
 }
 
 /** The npm registry this machine is configured to use (cached). */
+/** Trim trailing slashes; keep only http(s) URLs. Returns null otherwise. */
+function normalizeRegistryUrl(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim().replace(/\/+$/, '')
+  return /^https?:\/\//.test(trimmed) && trimmed.length > 'https://'.length ? trimmed : null
+}
+
 function npmRegistry() {
   if (cachedRegistryUrl !== null) return cachedRegistryUrl
+  const override = normalizeRegistryUrl(REGISTRY_OVERRIDE)
+  if (override !== null) {
+    cachedRegistryUrl = override
+    return cachedRegistryUrl
+  }
   try {
     const res = spawnSync('npm', ['config', 'get', 'registry'], {
       encoding: 'utf8',
@@ -269,13 +344,13 @@ function npmRegistry() {
 }
 
 /** GET a JSON document; resolves null on any failure (never throws). */
-function fetchJson(url, timeoutMs) {
+function fetchJson(url, timeoutMs, extraHeaders) {
   return new Promise((resolve) => {
     let settled = false
     const done = (value) => { if (!settled) { settled = true; resolve(value) } }
     try {
       const transport = url.startsWith('http:') ? http : https
-      const req = transport.get(url, { timeout: timeoutMs }, (res) => {
+      const req = transport.get(url, { timeout: timeoutMs, headers: { accept: 'application/json', ...(extraHeaders ?? {}) } }, (res) => {
         if (res.statusCode !== 200) { res.resume(); done(null); return }
         let data = ''
         res.setEncoding('utf8')
@@ -294,12 +369,28 @@ function fetchJson(url, timeoutMs) {
 }
 
 /** `npm install -g @deepseek-ai/dsh@<version>`; resolves { ok, log }. */
+/**
+ * Remember which dsh version we are upgrading FROM so a problematic new
+ * release can be rolled back with one command:
+ * `npm i -g @deepseek-ai/dsh@<previous>` (the desktop's local-version watcher
+ * then offers the restart).
+ */
+function recordPreviousDshVersion(previous) {
+  try {
+    if (previous === null || previous === undefined) return
+    const file = path.join(app.getPath('userData'), 'dsh-previous-version.json')
+    fs.writeFileSync(file, JSON.stringify({ previous, recordedAt: new Date().toISOString() }, null, 2), 'utf8')
+  } catch {
+    // Best effort only; never block the update flow.
+  }
+}
+
 function installGlobally(version) {
   return new Promise((resolve) => {
     if (installInFlight) { resolve({ ok: false, log: 'install already in flight' }); return }
     installInFlight = true
     let output = ''
-    const child = spawn('npm', ['install', '-g', `@deepseek-ai/dsh@${version}`], {
+    const child = spawn('npm', ['install', '-g', `@deepseek-ai/dsh@${version}`, '--registry', npmRegistry()], {
       shell: process.platform === 'win32',
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -366,7 +457,20 @@ async function checkForUpdateOnce() {
   const installed = installedDshInfo()
   const current = installed?.version ?? bundledDshVersion()
   if (current !== null && compareVersions(latest, current) <= 0) return
-  console.log(`[auto-update] registry has ${latest} > ${current ?? 'none'}: installing globally`)
+  console.log(`[auto-update] registry has ${latest} > ${current ?? 'none'} (mode: ${UPDATE_MODE})`)
+  // Record the version we are leaving behind (see recordPreviousDshVersion).
+  recordPreviousDshVersion(current)
+  if (UPDATE_MODE === 'notify') {
+    const answer = await dialog.showMessageBox({
+      type: 'info',
+      buttons: [`升级到 ${latest}`, '稍后'],
+      defaultId: 0,
+      cancelId: 1,
+      message: `发现 dsh 新版本 ${latest}`,
+      detail: `当前版本 ${current ?? '未知'}。升级在后台安装，完成后会提示重启。`,
+    })
+    if (answer.response !== 0) return
+  }
   const result = await installGlobally(latest)
   if (!result.ok) {
     console.warn('[auto-update] global install failed:\n' + result.log)
@@ -407,6 +511,163 @@ function stopAutoUpdate() {
   if (localVersionTimer !== null) {
     clearInterval(localVersionTimer)
     localVersionTimer = null
+  }
+}
+
+// --- Desktop shell self-update via GitHub Releases ---
+//
+// The dsh updater above keeps the runtime fresh; this one updates the desktop
+// shell itself. A release must carry two assets: `app.asar` and a
+// `SHA256SUMS` file (`<hex>  app.asar`). The staged download is hash-verified
+// before anything touches the live archive. Windows keeps the running asar
+// locked, so the actual swap is performed by a detached cmd helper that waits
+// for this exact process to exit, backs up the old archive, moves the new one
+// in, and relaunches the app.
+
+function selfUpdateResourcesDir() {
+  return path.dirname(app.getAppPath())
+}
+
+/** GET a binary body following up to 5 redirects; resolves Buffer or null. */
+function downloadToBuffer(url, timeoutMs, depth = 0) {
+  return new Promise((resolve) => {
+    if (depth > 5) { resolve(null); return }
+    try {
+      const req = https.get(url, { timeout: timeoutMs, headers: { 'user-agent': 'deepseek-harness-desktop' } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume()
+          downloadToBuffer(new URL(res.headers.location, url).toString(), timeoutMs, depth + 1).then(resolve)
+          return
+        }
+        if (res.statusCode !== 200) { res.resume(); resolve(null); return }
+        const chunks = []
+        res.on('data', (chunk) => chunks.push(chunk))
+        res.on('end', () => resolve(Buffer.concat(chunks)))
+        res.on('error', () => resolve(null))
+      })
+      req.on('error', () => resolve(null))
+      req.on('timeout', () => { req.destroy(); resolve(null) })
+    } catch {
+      resolve(null)
+    }
+  })
+}
+
+/** Expected sha256 for `app.asar` parsed out of a SHA256SUMS document. */
+function expectedSha256FromSums(text) {
+  for (const line of String(text).split(/\r?\n/)) {
+    const match = /^([0-9a-fA-F]{64})\s+\*?app\.asar\s*$/.exec(line.trim())
+    if (match) return match[1].toLowerCase()
+  }
+  return null
+}
+
+/**
+ * Minimal structural sanity check on a downloaded asar: the two-level pickle
+ * framing (u32 4 / regionLen / paddedStringSize / jsonLen) plus a JSON header
+ * naming exactly our entry files. Guards against truncated, corrupt or
+ * hostile non-asar payloads before they are staged next to the live archive.
+ */
+function looksLikeAppAsar(buf) {
+  try {
+    if (!Buffer.isBuffer(buf) || buf.length < 20) return false
+    if (buf.readUInt32LE(0) !== 4) return false
+    const headerSize = buf.readUInt32LE(12)
+    if (headerSize < 2 || headerSize > 16 * 1024 * 1024) return false
+    if (16 + headerSize > buf.length) return false
+    const header = JSON.parse(buf.slice(16, 16 + headerSize).toString('utf8'))
+    const files = header?.files ?? {}
+    return ['main.js', 'package.json', 'appearance.js', 'preload.js'].every((name) => name in files)
+  } catch {
+    return false
+  }
+}
+
+async function checkSelfUpdateOnce() {
+  if (process.env.DSH_DESKTOP_SMOKE === '1') return
+  if (process.env.DSH_DESKTOP_NO_SELF_UPDATE === '1') return
+  const localVersion = app.getVersion()
+  const release = await fetchJson(
+    `https://api.github.com/repos/${SELF_UPDATE_REPO}/releases/latest`,
+    10_000,
+    { 'user-agent': 'deepseek-harness-desktop' },
+  )
+  if (release === null || typeof release.tag_name !== 'string') return
+  const remoteVersion = release.tag_name.replace(/^v/, '')
+  if (!/^\d+\.\d+\.\d+/.test(remoteVersion)) return
+  if (compareVersions(localVersion, remoteVersion) >= 0) return
+  const assets = Array.isArray(release.assets) ? release.assets : []
+  const asarAsset = assets.find((a) => a && a.name === 'app.asar')
+  const sumsAsset = assets.find((a) => a && a.name === 'SHA256SUMS')
+  if (
+    !asarAsset || !sumsAsset
+    || typeof asarAsset.browser_download_url !== 'string'
+    || typeof sumsAsset.browser_download_url !== 'string'
+  ) return
+  const [asarBuf, sumsBuf] = await Promise.all([
+    downloadToBuffer(asarAsset.browser_download_url, SELF_UPDATE_DOWNLOAD_TIMEOUT_MS),
+    downloadToBuffer(sumsAsset.browser_download_url, SELF_UPDATE_DOWNLOAD_TIMEOUT_MS),
+  ])
+  if (asarBuf === null || sumsBuf === null || asarBuf.length < 1024) return
+  const expected = expectedSha256FromSums(sumsBuf.toString('utf8'))
+  const actual = crypto.createHash('sha256').update(asarBuf).digest('hex')
+  if (expected === null || expected !== actual) return
+  // Second integrity gate: the payload must parse as OUR app archive, not
+  // merely match a (same-source) hash file.
+  if (!looksLikeAppAsar(asarBuf)) return
+  fs.writeFileSync(path.join(selfUpdateResourcesDir(), 'app.asar.new-selfupdate'), asarBuf)
+  const answer = await dialog.showMessageBox({
+    type: 'info',
+    buttons: ['立即重启安装', '稍后'],
+    defaultId: 0,
+    cancelId: 1,
+    message: `桌面端新版本 ${remoteVersion} 已就绪（已校验 SHA256）`,
+    detail: `当前版本 ${localVersion}。安装会退出并自动重启桌面端。`,
+  })
+  if (answer.response !== 0) return
+  applySelfUpdate(remoteVersion)
+}
+
+/**
+ * Stage a detached cmd helper that waits for this exact process to exit,
+ * backs up the running archive, swaps in the verified one, and relaunches.
+ * ASCII-only content on purpose: cmd parses it under the OEM codepage.
+ */
+function applySelfUpdate(version) {
+  try {
+    const resDir = selfUpdateResourcesDir()
+    const script = [
+      '@echo off',
+      ':wait',
+      `tasklist /FI "PID eq ${process.pid}" | find /I "${process.pid}" >nul && (timeout /t 1 /nobreak >nul & goto wait)`,
+      `copy /y "${path.join(resDir, 'app.asar')}" "${path.join(resDir, `app.asar.bak-selfupdate-${version}`)}" >nul`,
+      `move /y "${path.join(resDir, 'app.asar.new-selfupdate')}" "${path.join(resDir, 'app.asar')}" >nul`,
+      `start "" "${process.execPath}"`,
+    ].join('\r\n')
+    const helper = path.join(resDir, 'apply-self-update.cmd')
+    fs.writeFileSync(helper, script, 'utf8')
+    const child = spawn('cmd', ['/c', helper], { detached: true, stdio: 'ignore', windowsHide: true })
+    child.unref()
+    app.quit()
+  } catch {
+    // Swallow: keeping the current version running is always safe.
+  }
+}
+
+function startSelfUpdate() {
+  if (process.env.DSH_DESKTOP_SMOKE === '1') return
+  if (process.env.DSH_DESKTOP_NO_SELF_UPDATE === '1') return
+  selfUpdateTimer = setTimeout(() => {
+    void checkSelfUpdateOnce()
+    selfUpdateTimer = setInterval(() => { void checkSelfUpdateOnce() }, SELF_UPDATE_CHECK_INTERVAL_MS)
+  }, SELF_UPDATE_FIRST_CHECK_MS)
+}
+
+function stopSelfUpdate() {
+  if (selfUpdateTimer !== null) {
+    clearTimeout(selfUpdateTimer)
+    clearInterval(selfUpdateTimer)
+    selfUpdateTimer = null
   }
 }
 
@@ -589,22 +850,91 @@ function safeSpawnServer() {
 // dsh web / this profile is already running), reuse it instead of spawning a
 // second server. A second server on the same profile would fail to boot
 // (task-board ledger lock), so attaching is both faster and conflict-free.
-function tryOpenExistingServer() {
-  if (window !== null) return
-  const url = process.env.DSH_WEB_URL || 'http://127.0.0.1:3080'
-  const req = http.get(url, { timeout: 1500 }, (res) => {
-    res.resume()
-    if (res.statusCode >= 200 && res.statusCode < 500) {
-      openWindow(url)
-    } else {
-      safeSpawnServer()
+/** Where we remember the last dsh web URL this shell spawned/attached to. */
+function lastSessionFile() {
+  try {
+    return path.join(app.getPath('userData'), 'dsh-last-session.json')
+  } catch {
+    return null
+  }
+}
+
+function saveLastSessionUrl(url) {
+  try {
+    const file = lastSessionFile()
+    if (file === null || typeof url !== 'string') return
+    fs.writeFileSync(file, JSON.stringify({ url, savedAt: new Date().toISOString() }), 'utf8')
+  } catch {
+    // Best effort; reuse is an optimization, never a requirement.
+  }
+}
+
+/** Last remembered loopback dsh URL, or null when absent/unshaped. */
+function readLastSessionUrl() {
+  try {
+    const file = lastSessionFile()
+    if (file === null || !fs.existsSync(file)) return null
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const url = typeof parsed?.url === 'string' ? parsed.url : null
+    return url !== null && /^http:\/\/127\.0\.0\.1:\d+$/.test(url) ? url : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Resolve true when `url` answers within timeoutMs AND the body identifies as
+ * our dsh web UI. The identity check keeps a stale remembered port that has
+ * since been taken by another local app from being mistaken for dsh.
+ */
+function probeDshWeb(url, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value) => { if (!settled) { settled = true; resolve(value) } }
+    try {
+      const transport = url.startsWith('http:') ? http : https
+      const req = transport.get(url, { timeout: timeoutMs }, (res) => {
+        if (res.statusCode < 200 || res.statusCode >= 500) { res.resume(); done(false); return }
+        let body = ''
+        let bytes = 0
+        res.on('data', (chunk) => { bytes += chunk.length; if (bytes <= 65536) body += chunk.toString() })
+        res.on('end', () => done(/deepseek|harness|dsh/i.test(body)))
+        res.on('error', () => done(false))
+      })
+      req.on('error', () => done(false))
+      req.on('timeout', () => { req.destroy(); done(false) })
+    } catch {
+      done(false)
     }
   })
-  req.on('error', () => safeSpawnServer())
-  req.on('timeout', () => {
-    req.destroy()
-    safeSpawnServer()
-  })
+}
+
+function tryOpenExistingServer() {
+  if (window !== null) return
+  // Probe order: explicit override → last session's port (covers random-port
+  // servers from a previous desktop run) → conventional 3080.
+  const candidates = []
+  if (process.env.DSH_WEB_URL) candidates.push(process.env.DSH_WEB_URL)
+  const saved = readLastSessionUrl()
+  if (saved && !candidates.includes(saved)) candidates.push(saved)
+  const fallback = 'http://127.0.0.1:3080'
+  if (!candidates.includes(fallback)) candidates.push(fallback)
+
+  let index = 0
+  const tryNext = () => {
+    if (window !== null) return
+    if (index >= candidates.length) { safeSpawnServer(); return }
+    const url = candidates[index++]
+    probeDshWeb(url, 1500).then((ok) => {
+      if (ok) {
+        console.log(`[reuse] attaching to existing dsh web at ${url}`)
+        openWindow(url)
+      } else {
+        tryNext()
+      }
+    })
+  }
+  tryNext()
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +1081,7 @@ function injectDesktopTitlebar(webContents) {
 }
 
 function openWindow(url) {
+  saveLastSessionUrl(url)
   const iconPath = windowIcon()
   const useNativeTitleBar = process.env.DSH_DESKTOP_NATIVE_TITLEBAR === '1'
   const overlay = titleBarColors()
@@ -782,6 +1113,50 @@ function openWindow(url) {
   window.on('page-title-updated', (event) => {
     event.preventDefault()
     window.setTitle(APP_TITLE)
+  })
+  // --- Runtime hardening (defense in depth; the shell already runs the page
+  // with contextIsolation + sandbox and no Node in the renderer) ---
+  let allowedOrigin = null
+  try { allowedOrigin = new URL(url).origin } catch { /* keep null: deny-by-default */ }
+  // Main-frame navigation stays on the served web UI's own origin; any other
+  // target (a plugin linking to an external site) is handed to the system
+  // browser instead of navigating this window away.
+  window.webContents.on('will-navigate', (event, target) => {
+    if (allowedOrigin !== null) {
+      try {
+        if (new URL(target).origin === allowedOrigin) return
+      } catch { /* malformed target: fall through to block */ }
+    }
+    event.preventDefault()
+    if (/^https?:\/\//i.test(target)) void shell.openExternal(target)
+  })
+  // Page-initiated popups never get a same-privilege Electron window:
+  // same-origin popups keep the classic in-app window, http(s) elsewhere goes
+  // to the system browser, and every other scheme is denied outright.
+  window.webContents.setWindowOpenHandler((details) => {
+    const target = typeof details?.url === 'string' ? details.url : ''
+    // Script-authored tool popups (about:blank canvases written by their
+    // opener — dsh-ssh's detachable terminals work this way) stay in-app:
+    // they inherit this sandboxed renderer's context and cannot out-privilege
+    // it, so denying them would only break plugin features.
+    if (target === '' || target === 'about:blank') {
+      return { action: 'allow', overrideBrowserWindowOptions: { autoHideMenuBar: true } }
+    }
+    if (allowedOrigin !== null) {
+      try {
+        if (new URL(target).origin === allowedOrigin) {
+          return { action: 'allow', overrideBrowserWindowOptions: { autoHideMenuBar: true } }
+        }
+      } catch { /* fall through */ }
+    }
+    if (/^https?:\/\//i.test(target)) void shell.openExternal(target)
+    return { action: 'deny' }
+  })
+  // The web UI needs none of these today; deny-by-default closes the door on
+  // camera/mic/geolocation/notification prompts from page content.
+  window.webContents.session.setPermissionRequestHandler((_webContents, permission, callback) => {
+    console.log(`[security] denied permission request: ${permission}`)
+    callback(false)
   })
   if (!useNativeTitleBar) {
     // Window-control IPC for the injected title bar.
@@ -854,6 +1229,8 @@ if (!gotLock) {
     // Keep the desktop on the newest dsh: registry check + auto global
     // install + restart prompt. Failures are non-fatal by design.
     startAutoUpdate()
+    // Keep the desktop shell itself fresh via GitHub Releases (hash-verified).
+    startSelfUpdate()
   })
 
   app.on('window-all-closed', () => {
@@ -863,6 +1240,7 @@ if (!gotLock) {
 
   app.on('before-quit', () => {
     stopAutoUpdate()
+    stopSelfUpdate()
     stopAppearanceSync()
     killServerTree()
   })
