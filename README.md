@@ -99,11 +99,15 @@ npx electron-builder --win portable --config electron-builder.config.cjs \
 |---|---|---|
 | `DSH_DESKTOP_NO_AUTO_UPDATE` | 未设置 | 设为 `1` 禁用自动更新 |
 | `DSH_DESKTOP_UPDATE_CHANNEL` | `next` | 要跟踪的 npm dist-tag，如 `next` 或 `latest` |
+| `DSH_DESKTOP_UPDATE_MODE` | `auto` | 设为 `notify` 时，发现 dsh 新版先弹窗确认再安装（默认静默安装后仅提示重启） |
+| `DSH_DESKTOP_REGISTRY` | 跟随 npm 全局配置 | 覆盖检查/安装使用的 npm registry（如 `https://registry.npmmirror.com` 镜像） |
 | `DSH_DESKTOP_GLOBAL_ROOT` | 自动探测 | 覆盖全局 dsh 的查找根目录 |
 | `DSH_DESKTOP_NATIVE_TITLEBAR` | 未设置 | 设为 `1` 回退原生标题栏 |
 | `DSH_WEB_URL` | `http://127.0.0.1:3080` | 覆盖服务复用探测地址 |
 
 如果机器上没有 `npm`、网络不可用、或设置了 `DSH_DESKTOP_SMOKE=1`（冒烟测试），自动更新会跳过并记录日志，不影响当前 dsh 运行。
+
+> 回滚：每次自动升级前会把当前版本记录到 `%APPDATA%/deepseek-harness-desktop/dsh-previous-version.json`；新版本有问题时执行 `npm i -g @deepseek-ai/dsh@<记录的 previous>` 即可退回，桌面端会感知并提示重启。
 
 ## 桌面壳自更新
 
