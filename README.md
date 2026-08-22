@@ -35,7 +35,6 @@
 ```
 desktop/
   main.js                    Electron 主进程（应用外壳）
-  update.js                 （预留模块）运行时暂存更新器，未接线；当前自动更新逻辑内置于 main.js
   preload.js                 窗口控制 IPC 桥（contextBridge）
   appearance.js              明暗主题同步
   package.json               外壳清单
