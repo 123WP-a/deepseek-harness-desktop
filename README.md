@@ -120,6 +120,15 @@ npx electron-builder --win portable --config electron-builder.config.cjs \
 
 > 注意：Release 资产下载走 `objects.githubusercontent.com`，无代理的受限网络下可能失败——失败会静默跳过，不影响使用。
 
+## 安全边界
+
+- 渲染层：`contextIsolation` + `sandbox` 开启、`nodeIntegration` 关闭；页面仅能通过 `preload.js` 暴露的最小窗口控制桥与主进程通信。
+- 导航锁：主窗口只允许停留在本机 dsh 服务的同源页面；其他目标一律拦截，http(s) 转交系统浏览器打开。
+- 弹窗策略：页面发起的 `window.open` 同源走应用内窗口、外链转系统浏览器、其余 scheme 直接拒绝——不存在同权限弹窗注入面。
+- 权限请求：摄像头/麦克风/地理位置/通知等一律拒绝（Web UI 无此需求）。
+- 桌面壳自更新：仅接受比当前版本更高的 Release；下载内容先过 SHA256 校验、再过 asar 结构校验（帧格式 + 四个入口成员），双门通过才会暂存换装。
+- CI：Actions 全部固定到 commit SHA，工作流不使用任何 secrets。
+
 ## 许可
 
 - 本项目代码：MIT（见 [LICENSE](./LICENSE)）。
