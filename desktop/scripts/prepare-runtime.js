@@ -74,15 +74,23 @@ function main() {
   } else {
     console.log(`No existing closure found; npm-installing @deepseek-ai/dsh@${DSH_VERSION} ...`)
     const npmCache = process.env.DSH_DESKTOP_NPM_CACHE || path.join(ROOT, '..', '.npm-cache')
-    execFileSync('npm', [
+    // Node ≥20.12 refuses to spawn .cmd shims without a shell (CVE-2024-27980),
+    // and bare 'npm' does not resolve to npm.cmd without one — either way
+    // execFileSync dies on Windows runners. Route through the shell explicitly
+    // and quote every argument (local checkout paths may contain spaces).
+    const q = (value) => (/[\s"]/.test(value) ? `"${value}"` : value)
+    const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    const cmdline = [
+      npmCmd,
       'install',
-      '--prefix', RUNTIME,
+      '--prefix', q(RUNTIME),
       `@deepseek-ai/dsh@${DSH_VERSION}`,
-      '--cache', npmCache,
+      '--cache', q(npmCache),
       '--ignore-scripts',
       '--no-audit',
       '--no-fund',
-    ], { stdio: 'inherit' })
+    ].map(q).join(' ')
+    execFileSync(cmdline, { stdio: 'inherit', shell: true })
   }
 
   if (!fs.existsSync(bin)) {
