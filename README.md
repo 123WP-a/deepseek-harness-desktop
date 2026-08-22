@@ -1,4 +1,4 @@
-# DeepSeek Harness Desktop
+﻿# DeepSeek Harness Desktop
 
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（[MIT](https://github.com/deepseek-ai/deepseek-harness/blob/main/LICENSE) 许可）的 Windows 桌面封装：双击即可启动，自动拉起内置的 `dsh web` 服务器并在 Electron 窗口中打开 Web GUI。
 
@@ -104,6 +104,18 @@ npx electron-builder --win portable --config electron-builder.config.cjs \
 | `DSH_WEB_URL` | `http://127.0.0.1:3080` | 覆盖服务复用探测地址 |
 
 如果机器上没有 `npm`、网络不可用、或设置了 `DSH_DESKTOP_SMOKE=1`（冒烟测试），自动更新会跳过并记录日志，不影响当前 dsh 运行。
+
+## 桌面壳自更新
+
+从 v0.1.1 起，桌面壳支持**自我更新**（与上面的 dsh 运行时自动更新相互独立）：
+
+1. 启动 60 秒后查询本仓库的 [latest release](https://github.com/123WP-a/deepseek-harness-desktop/releases/latest)，之后每 24 小时复查一次；
+2. 发现更高版本时下载资产 `app.asar` 与 `SHA256SUMS`，**先做 SHA256 校验**，通过才继续；
+3. 校验通过后弹窗询问「立即重启安装 / 稍后」；选择安装会退出当前实例（旧版自动备份为 `app.asar.bak-selfupdate-<版本>`）、换入新版并自动重启。
+
+可用环境变量：`DSH_DESKTOP_NO_SELF_UPDATE=1` 关闭；`DSH_DESKTOP_SELF_UPDATE_REPO` 覆盖检查的仓库（默认 `123WP-a/deepseek-harness-desktop`）。
+
+> 注意：Release 资产下载走 `objects.githubusercontent.com`，无代理的受限网络下可能失败——失败会静默跳过，不影响使用。
 
 ## 许可
 
