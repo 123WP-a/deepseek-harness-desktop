@@ -1,0 +1,67 @@
+name: release
+
+# 推送 v* tag 时自动构建桌面版并发布 Release。
+# Release 资产固定包含 app.asar 与 SHA256SUMS —— 桌面壳自更新依赖这两个名字。
+# 运行时闭包版本由 DSH_DESKTOP_VERSION 控制，升级 dsh 基线时同步修改此处。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: desktop
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 版本一致性检查（tag ↔ package.json）
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($tag -ne $pkg) { Write-Error "tag v$tag 与 package.json 版本 $pkg 不一致"; exit 1 }
+          Write-Host "版本一致: $pkg"
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 准备 dsh 运行时闭包
+        env:
+          DSH_DESKTOP_VERSION: 0.1.1-rc.2
+        run: node scripts/prepare-runtime.js
+
+      - name: 组装应用目录（electron-builder dir 目标）
+        run: node scripts/build.js
+
+      - name: 生成单文件便携版
+        run: npx electron-builder --win portable --config electron-builder.config.cjs --prepackaged "dist/DeepSeek Harness"
+
+      - name: 生成 SHA256SUMS 与自更新资产
+        shell: pwsh
+        run: |
+          $asar = "dist/DeepSeek Harness/resources/app.asar"
+          $h = (Get-FileHash $asar -Algorithm SHA256).Hash.ToLower()
+          "$h  app.asar" | Out-File -NoNewline -Encoding ascii dist/SHA256SUMS
+          Copy-Item $asar dist/app.asar
+          Write-Host "app.asar sha256 = $h"
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            desktop/dist/app.asar
+            desktop/dist/SHA256SUMS
+            desktop/dist/installer/*.exe
