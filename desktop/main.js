@@ -15,6 +15,7 @@
 const { app, BrowserWindow, dialog, ipcMain, nativeTheme } = require('electron')
 const { spawn, spawnSync } = require('node:child_process')
 const http = require('node:http')
+const https = require('node:https')
 const os = require('node:os')
 const path = require('node:path')
 const fs = require('node:fs')
@@ -38,23 +39,96 @@ function runtimeRoot() {
   return path.join(__dirname, 'runtime')
 }
 
+/** Read the version field of a dsh package.json; null when unreadable. */
+function dshVersionOf(pkgDir) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'))
+    return typeof manifest.version === 'string' ? manifest.version : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Candidate directories that may contain @deepseek-ai/dsh, best-first.
+ * Covers any npm/pnpm/cnpm global prefix — resolved via the `dsh` PATH shim
+ * and `npm root -g`, not just the three hardcoded legacy locations — so an
+ * updated global install is always picked up regardless of where it lives.
+ */
+function dshSearchRoots() {
+  const roots = []
+  const push = (dir) => { if (dir && !roots.includes(dir)) roots.push(dir) }
+
+  // 1. Explicit override for exotic setups.
+  push(process.env.DSH_DESKTOP_GLOBAL_ROOT)
+
+  // 2. Wherever the `dsh` launcher shim lives on PATH: its sibling
+  //    node_modules is that package manager's global root.
+  const pathEnv = process.env.PATH || ''
+  const exts = process.platform === 'win32'
+    ? (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';')
+    : ['']
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue
+    const hasShim = exts.some((ext) => fs.existsSync(path.join(dir, `dsh${ext}`)))
+      || fs.existsSync(path.join(dir, 'dsh'))
+    if (hasShim) push(path.join(dir, 'node_modules'))
+  }
+
+  // 3. Legacy hardcoded locations (cover standard installs without spawning).
+  if (process.env.APPDATA) push(path.join(process.env.APPDATA, 'npm', 'node_modules'))
+  if (process.env.ProgramFiles) push(path.join(process.env.ProgramFiles, 'nodejs', 'node_modules'))
+  if (process.env.LOCALAPPDATA) push(path.join(process.env.LOCALAPPDATA, 'Programs', 'nodejs', 'node_modules'))
+
+  // 4. Ask npm itself (authoritative for exotic prefixes; slow, so last).
+  try {
+    const res = spawnSync('npm', ['root', '-g'], {
+      encoding: 'utf8',
+      timeout: 15_000,
+      windowsHide: true,
+      shell: process.platform === 'win32',
+    })
+    if (res.status === 0 && typeof res.stdout === 'string') push(res.stdout.trim())
+  } catch {
+    // npm missing or slow — the remaining candidates still apply.
+  }
+
+  return roots
+}
+
+/** Cached global root holding @deepseek-ai/dsh (undefined = not resolved yet). */
+let cachedDshRoot = undefined
+
+/** The user-installed dsh (global npm): { bin, pkgDir, version } or null. */
+function installedDshInfo() {
+  const tryRoot = (root) => {
+    const pkgDir = path.join(root, '@deepseek-ai', 'dsh')
+    const bin = path.join(pkgDir, 'lib', 'bin.js')
+    if (!fs.existsSync(bin)) return null
+    // Version is read fresh on every call: a global update swaps the file
+    // contents under the same path, and the auto-update loop watches for that.
+    return { bin, pkgDir, version: dshVersionOf(pkgDir) }
+  }
+  if (cachedDshRoot !== undefined) {
+    const hit = tryRoot(cachedDshRoot)
+    if (hit !== null) return hit
+    cachedDshRoot = undefined // root vanished (uninstalled) — re-resolve below
+  }
+  for (const root of dshSearchRoots()) {
+    const hit = tryRoot(root)
+    if (hit !== null) {
+      cachedDshRoot = root
+      return hit
+    }
+  }
+  return null
+}
+
 // Prefer the user-installed dsh (global npm) so the desktop always matches the
 // dsh version the user runs/updates. The bundled runtime is only a fallback.
 function installedDshBin() {
-  const candidates = []
-  if (process.env.APPDATA) {
-    candidates.push(path.join(process.env.APPDATA, 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
-  }
-  if (process.env.ProgramFiles) {
-    candidates.push(path.join(process.env.ProgramFiles, 'nodejs', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
-  }
-  if (process.env.LOCALAPPDATA) {
-    candidates.push(path.join(process.env.LOCALAPPDATA, 'Programs', 'nodejs', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
-  }
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate
-  }
-  return null
+  const installed = installedDshInfo()
+  return installed !== null ? installed.bin : null
 }
 
 function serverBin() {
@@ -68,6 +142,272 @@ function serverBin() {
     'lib',
     'bin.js',
   )
+}
+
+/** dsh version baked into the packaged fallback runtime (or null). */
+function bundledDshVersion() {
+  return dshVersionOf(path.join(runtimeRoot(), 'node_modules', '@deepseek-ai', 'dsh'))
+}
+
+/**
+ * Whether this dsh build's `web` command understands --no-open.
+ *
+ * Newer dsh (0.1.1-rc line) hands the web URL to the default browser on boot
+ * (openBrowser defaults to true). The desktop window IS the browser surface,
+ * so the desktop passes --no-open when supported to avoid a second copy of
+ * the UI popping up in a browser tab. Older builds (bundled 0.1.0-rc fallback)
+ * reject unknown flags AND lack the auto-open behavior entirely, so skipping
+ * the flag there is both required and harmless. Cached per binary path.
+ */
+const noOpenSupportCache = new Map()
+function supportsNoOpen(bin) {
+  const cached = noOpenSupportCache.get(bin)
+  if (cached !== undefined) return cached
+  let supported = false
+  try {
+    const res = spawnSync(process.execPath, ['--expose-internals', bin, 'web', '--help'], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      encoding: 'utf8',
+      timeout: 20_000,
+      windowsHide: true,
+    })
+    supported = `${res.stdout ?? ''}\n${res.stderr ?? ''}`.includes('--no-open')
+  } catch {
+    supported = false
+  }
+  noOpenSupportCache.set(bin, supported)
+  return supported
+}
+
+// ---------------------------------------------------------------------------
+// Auto-update — keep the desktop on the newest released dsh
+// ---------------------------------------------------------------------------
+//
+// Behavior (opt out with DSH_DESKTOP_NO_AUTO_UPDATE=1):
+//  1. Shortly after launch, then every 6h, query the configured npm registry
+//     for the latest @deepseek-ai/dsh version.
+//  2. When the registry has a newer version than the one this session runs,
+//     install it globally (`npm install -g`) automatically.
+//  3. A running server keeps its already-loaded modules, so applying an
+//     update needs a restart: a one-click "Relaunch" dialog appears. The same
+//     dialog fires when the global install changes underneath us (e.g. the
+//     user ran `npm i -g @deepseek-ai/dsh` themselves).
+//
+// Failures (offline, npm errors) are logged and retried on the next tick;
+// they never block startup nor crash the app.
+
+const UPDATE_FIRST_CHECK_MS = 30_000
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
+const LOCAL_VERSION_POLL_MS = 60_000
+const INSTALL_TIMEOUT_MS = 5 * 60 * 1000
+/** npm dist-tag to follow: rc prereleases ship on `next`, stable ones on `latest`. */
+const UPDATE_CHANNEL = process.env.DSH_DESKTOP_UPDATE_CHANNEL || 'next'
+
+/** dsh version this desktop session launched with (null = unknown). */
+let launchedDshVersion = null
+let cachedRegistryUrl = null
+let updateCheckTimer = null
+let localVersionTimer = null
+let installInFlight = false
+let promptedForVersion = null
+
+/** Semver comparison good enough for x.y.z[-pre.N] release tags. */
+function compareVersions(a, b) {
+  const parse = (value) => {
+    const match = String(value).trim().replace(/^v/, '')
+      .match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.\-]+))?/)
+    if (!match) return null
+    return { major: +match[1], minor: +match[2], patch: +match[3], pre: match[4] ? match[4].split('.') : [] }
+  }
+  const left = parse(a)
+  const right = parse(b)
+  if (left === null || right === null) return 0
+  for (const key of ['major', 'minor', 'patch']) {
+    if (left[key] !== right[key]) return left[key] < right[key] ? -1 : 1
+  }
+  if (left.pre.length === 0 && right.pre.length === 0) return 0
+  if (left.pre.length === 0) return 1 // release > prerelease of same core
+  if (right.pre.length === 0) return -1
+  const length = Math.max(left.pre.length, right.pre.length)
+  for (let index = 0; index < length; index++) {
+    const x = left.pre[index]
+    const y = right.pre[index]
+    if (x === undefined) return -1
+    if (y === undefined) return 1
+    const xNumeric = /^\d+$/.test(x)
+    const yNumeric = /^\d+$/.test(y)
+    if (xNumeric && yNumeric) {
+      if (+x !== +y) return +x < +y ? -1 : 1
+    } else if (xNumeric !== yNumeric) {
+      return xNumeric ? -1 : 1 // numeric identifiers sort lower
+    } else if (x !== y) {
+      return x < y ? -1 : 1
+    }
+  }
+  return 0
+}
+
+/** The npm registry this machine is configured to use (cached). */
+function npmRegistry() {
+  if (cachedRegistryUrl !== null) return cachedRegistryUrl
+  try {
+    const res = spawnSync('npm', ['config', 'get', 'registry'], {
+      encoding: 'utf8',
+      timeout: 15_000,
+      windowsHide: true,
+      shell: process.platform === 'win32',
+    })
+    if (res.status === 0 && typeof res.stdout === 'string') {
+      const value = res.stdout.trim()
+      if (/^https?:\/\//.test(value)) cachedRegistryUrl = value
+    }
+  } catch {
+    // fall through to the default below
+  }
+  cachedRegistryUrl ??= 'https://registry.npmjs.org/'
+  return cachedRegistryUrl
+}
+
+/** GET a JSON document; resolves null on any failure (never throws). */
+function fetchJson(url, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value) => { if (!settled) { settled = true; resolve(value) } }
+    try {
+      const transport = url.startsWith('http:') ? http : https
+      const req = transport.get(url, { timeout: timeoutMs }, (res) => {
+        if (res.statusCode !== 200) { res.resume(); done(null); return }
+        let data = ''
+        res.setEncoding('utf8')
+        res.on('data', (chunk) => { data += chunk })
+        res.on('end', () => {
+          try { done(JSON.parse(data)) } catch { done(null) }
+        })
+        res.on('error', () => done(null))
+      })
+      req.on('error', () => done(null))
+      req.on('timeout', () => { req.destroy(); done(null) })
+    } catch {
+      done(null)
+    }
+  })
+}
+
+/** `npm install -g @deepseek-ai/dsh@<version>`; resolves { ok, log }. */
+function installGlobally(version) {
+  return new Promise((resolve) => {
+    if (installInFlight) { resolve({ ok: false, log: 'install already in flight' }); return }
+    installInFlight = true
+    let output = ''
+    const child = spawn('npm', ['install', '-g', `@deepseek-ai/dsh@${version}`], {
+      shell: process.platform === 'win32',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const timer = setTimeout(() => {
+      try { child.kill() } catch { /* already gone */ }
+    }, INSTALL_TIMEOUT_MS)
+    child.stdout?.on('data', (chunk) => { output += chunk.toString() })
+    child.stderr?.on('data', (chunk) => { output += chunk.toString() })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      installInFlight = false
+      resolve({ ok: false, log: String(error) + '\n' + output.slice(-2000) })
+    })
+    child.on('exit', (code) => {
+      clearTimeout(timer)
+      installInFlight = false
+      resolve({ ok: code === 0, log: output.slice(-2000) })
+    })
+  })
+}
+
+function relaunchToUpdate() {
+  app.relaunch()
+  app.quit()
+}
+
+/** One-click "restart to apply" dialog; deduplicated per target version. */
+function promptRestart(version) {
+  if (promptedForVersion === version) return
+  promptedForVersion = version
+  const options = {
+    type: 'info',
+    title: 'DeepSeek Harness — 更新就绪',
+    message: `dsh ${version} 已安装（当前运行 ${launchedDshVersion ?? '未知'}）`,
+    detail: '重启 DeepSeek Harness 后生效。正在运行的任务会被终止，会话数据不受影响。',
+    buttons: ['立即重启', '稍后'],
+    defaultId: 0,
+    cancelId: 1,
+  }
+  const show = () => {
+    const box = window !== null
+      ? dialog.showMessageBox(window, options)
+      : dialog.showMessageBox(options)
+    box.then(({ response }) => { if (response === 0) relaunchToUpdate() }).catch(() => {})
+  }
+  if (window !== null) show()
+  else app.whenReady().then(show).catch(() => {})
+}
+
+async function checkForUpdateOnce() {
+  if (process.env.DSH_DESKTOP_NO_AUTO_UPDATE === '1') return
+  // Resolve the configured dist-tag via the small dist-tags document rather
+  // than /latest: rc prereleases ship on `next`, so for a desktop following
+  // prereleases the `latest` pointer may never move. Falls back to `latest`
+  // when the configured tag is missing.
+  const base = npmRegistry().replace(/\/+$/, '')
+  const tags = await fetchJson(`${base}/-/package/${encodeURIComponent('@deepseek-ai/dsh')}/dist-tags`, 8000)
+  const latest = tags !== null && typeof tags === 'object'
+    ? (typeof tags[UPDATE_CHANNEL] === 'string' ? tags[UPDATE_CHANNEL]
+      : typeof tags.latest === 'string' ? tags.latest : null)
+    : null
+  if (latest === null) return
+  const installed = installedDshInfo()
+  const current = installed?.version ?? bundledDshVersion()
+  if (current !== null && compareVersions(latest, current) <= 0) return
+  console.log(`[auto-update] registry has ${latest} > ${current ?? 'none'}: installing globally`)
+  const result = await installGlobally(latest)
+  if (!result.ok) {
+    console.warn('[auto-update] global install failed:\n' + result.log)
+    return
+  }
+  const updated = installedDshInfo()
+  if (updated !== null && compareVersions(updated.version ?? '0.0.0', launchedDshVersion ?? '0.0.0') > 0) {
+    promptRestart(updated.version)
+  }
+}
+
+function startAutoUpdate() {
+  if (process.env.DSH_DESKTOP_SMOKE === '1') return
+  if (process.env.DSH_DESKTOP_NO_AUTO_UPDATE === '1') return
+  // Local watch: picks up manual `npm i -g` upgrades without waiting for the
+  // next registry tick.
+  localVersionTimer = setInterval(() => {
+    const installed = installedDshInfo()
+    if (
+      installed !== null
+      && compareVersions(installed.version ?? '0.0.0', launchedDshVersion ?? '0.0.0') > 0
+    ) {
+      promptRestart(installed.version)
+    }
+  }, LOCAL_VERSION_POLL_MS)
+  updateCheckTimer = setTimeout(() => {
+    void checkForUpdateOnce()
+    updateCheckTimer = setInterval(() => { void checkForUpdateOnce() }, UPDATE_CHECK_INTERVAL_MS)
+  }, UPDATE_FIRST_CHECK_MS)
+}
+
+function stopAutoUpdate() {
+  if (updateCheckTimer !== null) {
+    clearTimeout(updateCheckTimer)
+    clearInterval(updateCheckTimer)
+    updateCheckTimer = null
+  }
+  if (localVersionTimer !== null) {
+    clearInterval(localVersionTimer)
+    localVersionTimer = null
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,10 +441,18 @@ function spawnServer() {
       + 'The bundled runtime is missing. Rebuild the desktop app with: node scripts/build.js',
     )
   }
+  // Remember which dsh version this session launched with; the auto-update
+  // loop compares against it to decide when a restart is worth prompting.
+  const installed = installedDshInfo()
+  launchedDshVersion = installed?.version ?? bundledDshVersion()
   // ELECTRON_RUN_AS_NODE reuses this very executable as a plain Node runtime,
   // so no separate Node install is needed. --expose-internals is required by
-  // the harness's config-HMR watcher (cordis-plugin-hmr).
-  const child = spawn(process.execPath, ['--expose-internals', bin, 'web', '--port', '0'], {
+  // the harness's config-HMR watcher (cordis-plugin-hmr). --no-open keeps the
+  // spawned server from handing its URL to the default browser: the desktop
+  // window itself is that surface (only passed when the build supports it).
+  const args = ['--expose-internals', bin, 'web', '--port', '0']
+  if (supportsNoOpen(bin)) args.push('--no-open')
+  const child = spawn(process.execPath, args, {
     env: {
       ...process.env,
       ELECTRON_RUN_AS_NODE: '1',
@@ -357,6 +705,11 @@ function injectDesktopTitlebar(webContents) {
   const shiftJs = `(() => {
     const BAND = 32;
     const RIGHT_MARGIN = 220;
+    // Only small top-right CONTROL clusters get pushed below the band.
+    // Large surfaces (frosted side panels, translucent toolbars rendered by
+    // skin-center themes with backdrop-filter) must keep their geometry, or
+    // the translucent window frame develops a 32px gap under the title bar.
+    const CONTROL_MAX_HEIGHT = 96;
     const shift = () => {
       for (const el of document.querySelectorAll('body *')) {
         if (el.id === 'dsh-desktop-titlebar') continue;
@@ -366,8 +719,26 @@ function injectDesktopTitlebar(webContents) {
         try { r = el.getBoundingClientRect(); } catch { continue; }
         if (!r || r.width <= 0 || r.height <= 0) continue;
         if (r.top >= BAND || r.right <= window.innerWidth - RIGHT_MARGIN) continue;
+        // Control clusters only — never large translucent surfaces.
+        if (r.height > CONTROL_MAX_HEIGHT) continue;
         const s = getComputedStyle(el);
-        if (s.position !== 'fixed') continue;
+        // Fixed overlays AND absolute controls inside them both need the push:
+        // dsh-better-sidebar mounts a fullscreen fixed host layer
+        // ([data-dsh-panel-host]) with its top-right toggle cluster absolutely
+        // positioned inside (.nArs4W_toggleCluster, top:3px right:10px).
+        // Accepting only 'fixed' left those absolute buttons under the
+        // title-bar band whenever their fullscreen parent was (correctly)
+        // skipped by the isFullscreenLayer check below.
+        if (s.position !== 'fixed' && s.position !== 'absolute') continue;
+        // Skip background/fullscreen fixed layers (skin wallpaper, scrim,
+        // backdrop blur, fullscreen overlays): they are not top-right buttons
+        // and must not be pushed down by the title-bar band.
+        const z = Number(s.zIndex);
+        if (Number.isFinite(z) && z < 0) continue;
+        const isFullscreenLayer =
+          r.width >= window.innerWidth - 1 &&
+          r.height >= window.innerHeight - 1;
+        if (isFullscreenLayer) continue;
         el.dataset.dshDtShifted = 'true';
         el.style.setProperty('top', (Math.round(r.top + BAND)) + 'px', 'important');
       }
@@ -480,6 +851,9 @@ if (!gotLock) {
       dialog.showErrorBox('DeepSeek Harness — start failed', String(error))
       app.quit()
     }
+    // Keep the desktop on the newest dsh: registry check + auto global
+    // install + restart prompt. Failures are non-fatal by design.
+    startAutoUpdate()
   })
 
   app.on('window-all-closed', () => {
@@ -488,6 +862,7 @@ if (!gotLock) {
   })
 
   app.on('before-quit', () => {
+    stopAutoUpdate()
     stopAppearanceSync()
     killServerTree()
   })
