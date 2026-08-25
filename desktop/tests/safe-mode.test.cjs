@@ -1,0 +1,43 @@
+const assert = require('node:assert')
+const path = require('node:path')
+const os = require('node:os')
+const fs = require('node:fs')
+const { buildSafeModeOverlay, applyProfileSafeMode, restoreProfileSafeMode } = require('../safe-mode.js')
+
+const home = process.env.USERPROFILE || os.homedir()
+const dshHome = path.join(home, '.dsh')
+const runtimeRoot = path.join(__dirname, '..', 'runtime')
+const overlayPath = path.join(os.tmpdir(), 'dsh-safe-overlay-test-' + Date.now() + '.json')
+const log = []
+const out = buildSafeModeOverlay({ dshHome, profile: 'web', runtimeRoot, overlayPath, log })
+assert.strictEqual(out, overlayPath, 'overlay returned path')
+const overlay = JSON.parse(fs.readFileSync(overlayPath, 'utf8'))
+assert.ok(Array.isArray(overlay), 'overlay is array')
+assert.ok(overlay.length >= 20, 'overlay >= 20 entries, got ' + overlay.length)
+const ids = overlay.map((o) => o.id)
+const core = ['llm', 'agent', 'session', 'tools', 'agent-loop', 'system-prompt', 'hmr', 'session-title']
+assert.strictEqual(core.filter((k) => ids.includes(k)).length, 0, 'no official core leaked')
+for (const k of ['web-ui-market', 'web-ui-ssh', 'dsh-super-injector', 'context-doctor', 'archive-manager', 'web-ui-pet']) assert.ok(ids.includes(k), 'missing ' + k)
+assert.strictEqual(log.filter((x) => x.includes('failed to parse')).length, 0, 'no parse failures')
+fs.rmSync(overlayPath, { force: true })
+
+// apply/restore roundtrip on a synthetic home (never touches the real profile)
+const home2 = path.join(os.tmpdir(), 'dsh-smroundtrip-' + Date.now())
+fs.mkdirSync(path.join(home2, 'profiles', 'web'), { recursive: true })
+fs.writeFileSync(path.join(home2, 'profiles', 'web', 'package.json'), JSON.stringify({ name: 'p', private: true, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] } } }))
+const origPatch = '- id: probe-x\n  name: \'probe-x\'\n'
+fs.writeFileSync(path.join(home2, 'profiles', 'web', 'cordis.patch.yml'), origPatch)
+const log2 = []
+assert.strictEqual(applyProfileSafeMode({ dshHome: home2, profile: 'web', runtimeRoot, log: log2 }), true, 'apply')
+const mutated = fs.readFileSync(path.join(home2, 'profiles', 'web', 'cordis.patch.yml'), 'utf8')
+assert.ok(mutated.includes('probe-x') && mutated.includes('disabled: true'), 'disable row appended')
+assert.ok(fs.existsSync(path.join(home2, 'profiles', 'web', 'cordis.patch.yml.safe-backup')), 'backup exists')
+assert.strictEqual(applyProfileSafeMode({ dshHome: home2, profile: 'web', runtimeRoot, log: log2 }), true, 'idempotent re-apply')
+assert.strictEqual(restoreProfileSafeMode({ dshHome: home2, profile: 'web' }), true, 'restore')
+assert.strictEqual(fs.readFileSync(path.join(home2, 'profiles', 'web', 'cordis.patch.yml'), 'utf8'), origPatch, 'restored content identical')
+assert.ok(!fs.existsSync(path.join(home2, 'profiles', 'web', 'cordis.patch.yml.safe-backup')), 'backup gone')
+assert.strictEqual(restoreProfileSafeMode({ dshHome: home2, profile: 'web' }), false, 'restore no-op without backup')
+fs.rmSync(home2, { recursive: true, force: true })
+console.log('safe-mode roundtrip: PASS')
+
+console.log('B safe-mode: PASS (' + overlay.length + ' entries, official core protected)')
