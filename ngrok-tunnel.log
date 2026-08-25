@@ -1,0 +1,9 @@
+{"lvl":"info","msg":"no configuration paths supplied","t":"2026-08-25T18:56:15.0540608+08:00"}
+{"lvl":"info","msg":"using configuration at default config path","path":"C:\\Users\\ASUS\\AppData\\Local\\ngrok\\ngrok.yml","t":"2026-08-25T18:56:15.0770318+08:00"}
+{"err":"\u003cnil\u003e","lvl":"info","msg":"open config file","path":"C:\\Users\\ASUS\\AppData\\Local\\ngrok\\ngrok.yml","t":"2026-08-25T18:56:15.0775394+08:00"}
+{"enabled":false,"lvl":"info","msg":"FIPS 140 mode","t":"2026-08-25T18:56:15.0785779+08:00"}
+{"addr":"127.0.0.1:4040","allow_hosts":null,"lvl":"info","msg":"starting web service","obj":"web","t":"2026-08-25T18:56:15.1126266+08:00"}
+{"lvl":"info","msg":"client session established","obj":"tunnels.session","t":"2026-08-25T18:56:15.9763712+08:00"}
+{"lvl":"info","msg":"tunnel session started","obj":"tunnels.session","t":"2026-08-25T18:56:15.9778779+08:00"}
+{"addr":"http://localhost:55696","lvl":"info","msg":"started tunnel","name":"command_line","obj":"tunnels","t":"2026-08-25T18:56:16.2118086+08:00","url":"https://angriness-unshackle-conjoined.ngrok-free.dev"}
+{"id":"71a4f5cc1289","l":"127.0.0.1:55696","lvl":"info","msg":"join connections","obj":"join","r":"45.149.92.22:43082","t":"2026-08-25T18:56:27.2785882+08:00"}
